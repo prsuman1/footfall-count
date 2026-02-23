@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pt
+debug_output.mp4
+debug_frames/
+.DS_Store
+screenshots/
+footfall_log.csv
+sample_videos/
+config.yaml
