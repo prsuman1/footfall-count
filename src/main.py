@@ -1,6 +1,7 @@
 """Footfall Counter - Main Pipeline
 
 Connects all components: camera → detector → staff filter → counter → display.
+Uses a separate detection thread so display never freezes.
 
 Usage:
     python src/main.py                          # Use config.yaml defaults
@@ -9,10 +10,12 @@ Usage:
 """
 
 import argparse
+import queue
 import signal
 import sys
 import os
 import time
+import threading
 
 import cv2
 import supervision as sv
@@ -38,10 +41,12 @@ class FootfallPipeline:
         self.camera = RTSPCamera(source, camera_id="cam_0")
 
         # Detector
+        detection_zone = config.get("detection_zone", None)
         self.detector = PersonDetector(
             model_path=config["settings"].get("model", "yolov8s.pt"),
             confidence=config["settings"]["confidence"],
             min_bbox_area=config["settings"].get("min_bbox_area", 0),
+            detection_zone=detection_zone,
         )
 
         # Counter
@@ -67,12 +72,18 @@ class FootfallPipeline:
         self.label_annotator = sv.LabelAnnotator(text_position=sv.Position.TOP_CENTER)
         self.line_annotator = sv.LineZoneAnnotator(display_in_count=False, display_out_count=False)
 
-        # Frame skip
-        self.process_every_n = config["settings"]["process_every_n_frames"]
-        self.frame_count = 0
-        self.none_frame_count = 0
+        # Shared state between display and detection threads (protected by lock)
+        self._lock = threading.Lock()
+        self._det_queue = queue.Queue(maxsize=5)  # frames for detection thread to process in order
         self.last_detections = sv.Detections.empty()
         self.last_counts = {"entries": 0, "exits": 0, "occupancy": 0}
+
+        # Frame skip for detection
+        self.process_every_n = config["settings"]["process_every_n_frames"]
+
+        # Frame counters
+        self.frame_count = 0
+        self.none_frame_count = 0
 
         # FPS tracking
         self.fps = 0
@@ -82,8 +93,38 @@ class FootfallPipeline:
         # Logging
         self.last_log_time = time.time()
 
+    def _detection_loop(self):
+        """Background thread: processes frames from queue in order."""
+        det_frame_count = 0
+        while self.running:
+            try:
+                frame = self._det_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            det_frame_count += 1
+
+            # Run detection + tracking
+            detections = self.detector.detect_and_track(frame)
+
+            # Staff exclusion
+            self.staff_excluder.update(detections)
+            customer_detections = self.staff_excluder.filter_customers(detections)
+
+            # Count line crossings
+            counts = self.counter.update(customer_detections, frame=frame)
+
+            # Store results thread-safely
+            with self._lock:
+                self.last_detections = customer_detections
+                self.last_counts = counts
+
+            # Periodically cleanup old tracks
+            if det_frame_count % 150 == 0:
+                self.staff_excluder.cleanup_old_tracks(detections.tracker_id)
+
     def run(self):
-        """Main processing loop."""
+        """Main display loop — always smooth, detection runs in background."""
         # Register signal handler for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
 
@@ -91,6 +132,10 @@ class FootfallPipeline:
         self.camera.start()
         print("[Pipeline] Running... Press Q to quit.")
         print()
+
+        # Start detection thread
+        det_thread = threading.Thread(target=self._detection_loop, daemon=True)
+        det_thread.start()
 
         while self.running:
             frame = self.camera.read()
@@ -103,31 +148,24 @@ class FootfallPipeline:
                     print("[Pipeline] Stream lost, forcing reconnect...")
                     self.camera.connected = False
                     self.none_frame_count = 0
-                else:
-                    print("[Pipeline] Waiting for frame...")
                 continue
 
             self.none_frame_count = 0
-
             self.frame_count += 1
 
-            # Process every Nth frame
+            # Send every Nth frame to detection thread (in order, non-blocking)
             if self.frame_count % self.process_every_n == 0:
-                detections = self.detector.detect_and_track(frame)
+                try:
+                    self._det_queue.put_nowait(frame)
+                except queue.Full:
+                    # Detection is behind — drop oldest, add newest
+                    try:
+                        self._det_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self._det_queue.put_nowait(frame)
 
-                # Staff exclusion
-                self.staff_excluder.update(detections)
-                customer_detections = self.staff_excluder.filter_customers(detections)
-
-                # Count line crossings (use customer detections only)
-                self.last_counts = self.counter.update(customer_detections, frame=frame)
-                self.last_detections = customer_detections
-
-                # Periodically cleanup old tracks
-                if self.frame_count % 300 == 0:
-                    self.staff_excluder.cleanup_old_tracks(detections.tracker_id)
-
-            # Annotate frame
+            # Annotate frame using latest detection results (non-blocking)
             annotated = self._annotate(frame)
 
             # Write to video file or show on screen
@@ -179,27 +217,31 @@ class FootfallPipeline:
         )
 
         # Draw bounding boxes and labels on customers
-        if len(self.last_detections) > 0:
+        with self._lock:
+            detections = self.last_detections
+            counts = self.last_counts
+
+        if len(detections) > 0:
             labels = []
-            for i in range(len(self.last_detections)):
-                tid = self.last_detections.tracker_id[i] if self.last_detections.tracker_id is not None else "?"
-                conf = self.last_detections.confidence[i] if self.last_detections.confidence is not None else 0
+            for i in range(len(detections)):
+                tid = detections.tracker_id[i] if detections.tracker_id is not None else "?"
+                conf = detections.confidence[i] if detections.confidence is not None else 0
                 labels.append(f"#{tid} {conf:.1%}")
 
             annotated = self.box_annotator.annotate(
                 scene=annotated,
-                detections=self.last_detections,
+                detections=detections,
             )
             annotated = self.label_annotator.annotate(
                 scene=annotated,
-                detections=self.last_detections,
+                detections=detections,
                 labels=labels,
             )
 
         # Draw counts overlay
         annotated = draw_counts_overlay(
             annotated,
-            self.last_counts,
+            counts,
             staff_excluded=self.staff_excluder.staff_count,
             fps=self.fps,
         )
