@@ -43,7 +43,7 @@ class FootfallCounter:
     Cooldown is shared across all lines to prevent double-counting.
     """
 
-    MIN_DISPLACEMENT = 0.5  # pixels — must be seen on both sides of at least one line
+    MIN_DISPLACEMENT = 0.1  # pixels — must be seen on both sides of at least one line
     COOLDOWN_FRAMES = 150          # ignore same tracker for ~12s after counting
 
     def __init__(self, lines=None, line_start=None, line_end=None,
