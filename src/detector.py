@@ -12,7 +12,7 @@ class PersonDetector:
     for persistent tracking IDs across frames.
     """
 
-    def __init__(self, model_path="yolov8n.pt", confidence=0.5, device=None, min_bbox_area=0, detection_zone=None):
+    def __init__(self, model_path="yolov8n.pt", confidence=0.3, device=None, min_bbox_area=0, detection_zone=None):
         self.confidence = confidence
         self.min_bbox_area = min_bbox_area  # Filter out small detections (people far away/through glass)
 
@@ -38,14 +38,14 @@ class PersonDetector:
         print(f"[Detector] Loading {model_path} on {self.device}")
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack(
-            track_activation_threshold=0.25,
-            lost_track_buffer=90,
+            track_activation_threshold=0.4,
+            lost_track_buffer=30,
             minimum_matching_threshold=0.7,
-            frame_rate=30,
+            frame_rate=30,  # max_time_lost = int(30/30*30) = 30 frames ≈ 3-4s at ~8fps
         )
 
         # Warm up the model
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        dummy = np.zeros((540, 960, 3), dtype=np.uint8)
         self.model.predict(dummy, classes=[0], conf=self.confidence, device=self.device, verbose=False)
         print("[Detector] Model loaded and warmed up")
 

@@ -18,10 +18,11 @@ def load_config(path="config.yaml"):
     # Validate required fields
     if "camera" not in config or "source" not in config["camera"]:
         raise ValueError("Config missing camera.source")
-    if "counting_line" not in config:
-        raise ValueError("Config missing counting_line (run setup_tool.py first)")
-    if "start" not in config["counting_line"] or "end" not in config["counting_line"]:
-        raise ValueError("Config missing counting_line.start or counting_line.end")
+    if "counting_line" not in config and "counting_lines" not in config:
+        raise ValueError("Config missing counting_line/counting_lines (run setup_tool.py first)")
+    if "counting_line" in config:
+        if "start" not in config["counting_line"] or "end" not in config["counting_line"]:
+            raise ValueError("Config missing counting_line.start or counting_line.end")
 
     # Defaults for settings
     settings = config.get("settings", {})

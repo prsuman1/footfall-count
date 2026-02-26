@@ -4,7 +4,7 @@ import queue
 import time
 import os
 
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;30000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000"
 
 
 class RTSPCamera:
@@ -18,7 +18,7 @@ class RTSPCamera:
     def __init__(self, source, camera_id="cam_0"):
         self.source = source
         self.camera_id = camera_id
-        self.frame_queue = queue.Queue(maxsize=10)
+        self.frame_queue = queue.Queue(maxsize=2)
         self.stopped = False
         self.connected = False
         self.consecutive_failures = 0
@@ -145,11 +145,34 @@ class RTSPCamera:
                 time.sleep(0.001)
 
     def read(self):
-        """Get the latest frame. Returns None on timeout."""
+        """Get the latest frame. Drains queue to return freshest frame."""
+        frame = None
         try:
-            return self.frame_queue.get(timeout=5)
+            # Drain queue to get the freshest frame
+            while True:
+                frame = self.frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if frame is not None:
+            return frame
+        # No frame available — wait briefly
+        try:
+            return self.frame_queue.get(timeout=0.1)
         except queue.Empty:
             return None
+
+    def force_reconnect(self):
+        """Force an immediate reconnect by releasing the capture device.
+
+        This interrupts any blocked grab() call, avoiding the 5s FFmpeg timeout
+        before reconnect begins.
+        """
+        with self._lock:
+            self.connected = False
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+        print(f"[{self.camera_id}] Force reconnect triggered")
 
     def stop(self):
         """Stop the reader thread and release resources."""

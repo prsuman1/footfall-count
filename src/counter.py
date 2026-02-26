@@ -9,46 +9,73 @@ import numpy as np
 import supervision as sv
 
 
-class FootfallCounter:
-    """Line-crossing counter using supervision LineZone with displacement validation.
-
-    Counts entries and exits based on people crossing a virtual line.
-    Direction is determined by the line orientation (start -> end).
-    Uses perpendicular displacement validation to reject bbox-jitter crossings:
-    a crossing is only accepted if the tracker was observed at least MIN_DISPLACEMENT
-    pixels on BOTH sides of the line.
-    """
-
-    MIN_DISPLACEMENT_STORE = 5     # pixels — must walk 5px into the store side
-    MIN_DISPLACEMENT_APPROACH = 2  # pixels — confirm they came from outside
-    COOLDOWN_FRAMES = 150          # ignore same tracker for ~12s after counting
-
-    def __init__(self, line_start, line_end, minimum_crossing_threshold=2, csv_path=None):
-        """
-        Args:
-            line_start: (x, y) tuple for line start point
-            line_end: (x, y) tuple for line end point
-            minimum_crossing_threshold: consecutive frames on one side before counting
-            csv_path: path to CSV log file (None to disable logging)
-        """
+class _LineData:
+    """Internal data for a single counting line."""
+    def __init__(self, line_start, line_end, minimum_crossing_threshold, in_direction_point, index):
         self.line_zone = sv.LineZone(
             start=sv.Point(line_start[0], line_start[1]),
             end=sv.Point(line_end[0], line_end[1]),
             triggering_anchors=[sv.Position.BOTTOM_CENTER],
             minimum_crossing_threshold=minimum_crossing_threshold,
         )
-
-        # Precompute line normal for signed-distance calculation
         start = np.array(line_start, dtype=np.float64)
         end = np.array(line_end, dtype=np.float64)
         line_vec = end - start
-        self._line_normal = np.array([-line_vec[1], line_vec[0]])
-        self._line_normal_len = np.linalg.norm(self._line_normal)
-        self._line_start = start
+        self.normal = np.array([-line_vec[1], line_vec[0]])
+        self.normal_len = np.linalg.norm(self.normal)
+        self.start = start
+        self.index = index
 
-        # Per-tracker displacement tracking: tid -> (max_positive_dist, min_negative_dist)
-        self._tracker_extremes: dict[int, tuple[float, float]] = {}
-        # Per-tracker cooldown: tid -> frame_count when last counted
+        if in_direction_point is not None:
+            dist = np.dot(np.array(in_direction_point, dtype=np.float64) - start, self.normal) / self.normal_len
+            self.in_is_crossed_in = dist < 0
+            side = "LEFT (crossed_in=ENTRY)" if self.in_is_crossed_in else "RIGHT (crossed_out=ENTRY)"
+            print(f"[Counter] Line {index+1}: in_direction_point {in_direction_point} on {side} side (dist={dist:.1f})")
+        else:
+            self.in_is_crossed_in = True
+            print(f"[Counter] Line {index+1}: no in_direction_point, defaulting crossed_in=ENTRY")
+
+
+class FootfallCounter:
+    """Multi-line crossing counter using supervision LineZone with displacement validation.
+
+    Supports 1 or more counting lines. A person crossing ANY line gets counted.
+    Cooldown is shared across all lines to prevent double-counting.
+    """
+
+    MIN_DISPLACEMENT = 0.5  # pixels — must be seen on both sides of at least one line
+    COOLDOWN_FRAMES = 150          # ignore same tracker for ~12s after counting
+
+    def __init__(self, lines=None, line_start=None, line_end=None,
+                 minimum_crossing_threshold=2, csv_path=None, in_direction_point=None):
+        """
+        Args:
+            lines: list of dicts with keys: start, end, in_direction_point (optional).
+                   If provided, line_start/line_end/in_direction_point are ignored.
+            line_start: (x, y) for single line (backward compat)
+            line_end: (x, y) for single line (backward compat)
+            minimum_crossing_threshold: consecutive frames on one side before counting
+            csv_path: path to CSV log file
+            in_direction_point: (x, y) for single line (backward compat)
+        """
+        # Build line list — support both new multi-line and old single-line API
+        if lines is None:
+            lines = [{"start": line_start, "end": line_end, "in_direction_point": in_direction_point}]
+
+        self._lines = []
+        for i, line_cfg in enumerate(lines):
+            ld = _LineData(
+                line_start=line_cfg["start"],
+                line_end=line_cfg["end"],
+                minimum_crossing_threshold=minimum_crossing_threshold,
+                in_direction_point=line_cfg.get("in_direction_point"),
+                index=i,
+            )
+            self._lines.append(ld)
+
+        # Per-line per-tracker displacement: line_idx -> {tid -> (max_pos, min_neg)}
+        self._tracker_extremes: list[dict[int, tuple[float, float]]] = [{} for _ in self._lines]
+        # Shared cooldown across all lines: tid -> frame_count when last counted
         self._tracker_cooldown: dict[int, int] = {}
         self._frame_count = 0
 
@@ -65,52 +92,50 @@ class FootfallCounter:
             if write_header:
                 self._csv_writer.writerow(["timestamp", "event", "count", "screenshot"])
 
-    def _signed_distance(self, point):
-        """Compute signed perpendicular distance from a point to the line."""
-        return np.dot(point - self._line_start, self._line_normal) / self._line_normal_len
+    def _signed_distance(self, point, line_data):
+        """Compute signed perpendicular distance from a point to a line."""
+        return np.dot(point - line_data.start, line_data.normal) / line_data.normal_len
 
     def _update_tracker_extremes(self, detections):
-        """Update max positive and min negative signed distances for each tracker."""
+        """Update displacement extremes for each tracker on each line."""
         if detections.tracker_id is None or len(detections) == 0:
             return
+        for line_idx, ld in enumerate(self._lines):
+            extremes = self._tracker_extremes[line_idx]
+            for i, tid in enumerate(detections.tracker_id):
+                tid = int(tid)
+                bbox = detections.xyxy[i]
+                bottom_center = np.array([(bbox[0] + bbox[2]) / 2, bbox[3]])
+                dist = self._signed_distance(bottom_center, ld)
+                if tid in extremes:
+                    max_pos, min_neg = extremes[tid]
+                    extremes[tid] = (max(max_pos, dist), min(min_neg, dist))
+                else:
+                    extremes[tid] = (dist, dist)
 
-        for i, tid in enumerate(detections.tracker_id):
-            tid = int(tid)
-            bbox = detections.xyxy[i]
-            # Bottom center — matches the triggering anchor
-            bottom_center = np.array([(bbox[0] + bbox[2]) / 2, bbox[3]])
-            dist = self._signed_distance(bottom_center)
-
-            if tid in self._tracker_extremes:
-                max_pos, min_neg = self._tracker_extremes[tid]
-                self._tracker_extremes[tid] = (max(max_pos, dist), min(min_neg, dist))
-            else:
-                self._tracker_extremes[tid] = (dist, dist)
-
-    def _has_real_displacement(self, tid):
-        """Check if tracker has been seen on both sides of the line (asymmetric thresholds)."""
-        if tid not in self._tracker_extremes:
+    def _has_real_displacement(self, tid, line_idx):
+        """Check if tracker has been seen on both sides of a specific line."""
+        extremes = self._tracker_extremes[line_idx]
+        if tid not in extremes:
             return False
-        max_pos, min_neg = self._tracker_extremes[tid]
-        return max_pos >= self.MIN_DISPLACEMENT_APPROACH and min_neg <= -self.MIN_DISPLACEMENT_STORE
+        max_pos, min_neg = extremes[tid]
+        return max_pos >= self.MIN_DISPLACEMENT and min_neg <= -self.MIN_DISPLACEMENT
 
     def _prune_stale_trackers(self, active_ids):
         """Remove displacement and cooldown data for trackers no longer active."""
         if active_ids is None:
             return
         active = set(int(x) for x in active_ids)
-        stale = set(self._tracker_extremes.keys()) - active
-        for tid in stale:
-            del self._tracker_extremes[tid]
+        for extremes in self._tracker_extremes:
+            stale = set(extremes.keys()) - active
+            for tid in stale:
+                del extremes[tid]
         stale_cd = set(self._tracker_cooldown.keys()) - active
         for tid in stale_cd:
             del self._tracker_cooldown[tid]
 
     def update(self, detections, frame=None):
-        """Process detections and update entry/exit counts.
-
-        Uses supervision's LineZone for crossing detection, then validates
-        each crossing with perpendicular displacement check.
+        """Process detections and update entry/exit counts across all lines.
 
         Args:
             detections: sv.Detections with tracker_id
@@ -120,36 +145,56 @@ class FootfallCounter:
             dict with entries, exits, occupancy
         """
         self._frame_count += 1
-
-        # Update displacement tracking for all visible trackers
         self._update_tracker_extremes(detections)
 
-        # Get crossing events from LineZone
-        crossed_in, crossed_out = self.line_zone.trigger(detections)
+        # Collect validated crossings across all lines, dedup by tracker ID
+        # Only the first crossing per tracker per frame wins (prevents X-line double-count)
+        entry_tids = set()
+        exit_tids = set()
 
-        # Count crossings with displacement validation (prevents double-counting)
-        new_entries = 0
-        new_exits = 0
+        for line_idx, ld in enumerate(self._lines):
+            crossed_in, crossed_out = ld.line_zone.trigger(detections)
 
-        if detections.tracker_id is not None and len(detections) > 0:
+            if detections.tracker_id is None or len(detections) == 0:
+                continue
+
             for i, tid in enumerate(detections.tracker_id):
                 tid = int(tid)
-                # Skip if tracker is in cooldown period
+                # Shared cooldown — if counted on ANY line, skip
                 if tid in self._tracker_cooldown:
                     if self._frame_count - self._tracker_cooldown[tid] < self.COOLDOWN_FRAMES:
                         continue
                     else:
                         del self._tracker_cooldown[tid]
-                if crossed_out[i] and self._has_real_displacement(tid):
-                    # ENTRY: needs displacement validation
-                    new_entries += 1
-                    self._tracker_extremes.pop(tid, None)
-                    self._tracker_cooldown[tid] = self._frame_count
-                if crossed_in[i]:
-                    # EXIT: cooldown-only dedup
-                    new_exits += 1
-                    self._tracker_extremes.pop(tid, None)
-                    self._tracker_cooldown[tid] = self._frame_count
+
+                # Already counted this frame on another line
+                if tid in entry_tids or tid in exit_tids:
+                    continue
+
+                is_entry = crossed_in[i] if ld.in_is_crossed_in else crossed_out[i]
+                is_exit = crossed_out[i] if ld.in_is_crossed_in else crossed_in[i]
+
+                if is_entry:
+                    has_disp = self._has_real_displacement(tid, line_idx)
+                    extremes = self._tracker_extremes[line_idx].get(tid, (0, 0))
+                    print(f"[CROSS] L{line_idx+1} tid={tid} ENTRY candidate disp={has_disp} extremes={extremes}")
+                    if has_disp:
+                        entry_tids.add(tid)
+                if is_exit:
+                    has_disp = self._has_real_displacement(tid, line_idx)
+                    extremes = self._tracker_extremes[line_idx].get(tid, (0, 0))
+                    print(f"[CROSS] L{line_idx+1} tid={tid} EXIT candidate disp={has_disp} extremes={extremes}")
+                    if has_disp:
+                        exit_tids.add(tid)
+
+        # Apply cooldown for all counted tids
+        for tid in entry_tids | exit_tids:
+            for ex in self._tracker_extremes:
+                ex.pop(tid, None)
+            self._tracker_cooldown[tid] = self._frame_count
+
+        new_entries = len(entry_tids)
+        new_exits = len(exit_tids)
 
         self._validated_entries += new_entries
         self._validated_exits += new_exits
@@ -200,6 +245,16 @@ class FootfallCounter:
             "exits": exits,
             "occupancy": occupancy,
         }
+
+    @property
+    def line_zones(self):
+        """Get all LineZone objects for annotation."""
+        return [ld.line_zone for ld in self._lines]
+
+    @property
+    def line_zone(self):
+        """Get first LineZone (backward compat for annotation)."""
+        return self._lines[0].line_zone if self._lines else None
 
     @property
     def line_annotator(self):

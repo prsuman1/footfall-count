@@ -35,6 +35,10 @@ class FootfallPipeline:
         self.save_video = save_video
         self.video_writer = None
 
+        # Target resolution from config (lines were drawn at this size)
+        res = config["camera"].get("resolution", [])
+        self.target_resolution = tuple(res) if res else None
+
         # Camera
         source = config["camera"]["source"]
         print(f"[Pipeline] Source: {source}")
@@ -49,13 +53,16 @@ class FootfallPipeline:
             detection_zone=detection_zone,
         )
 
-        # Counter
-        line = config["counting_line"]
+        # Counter — supports both single "counting_line" and multi "counting_lines"
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         csv_path = os.path.join(project_root, "footfall_log.csv")
+        if "counting_lines" in config:
+            lines = config["counting_lines"]
+        else:
+            line = config["counting_line"]
+            lines = [line]
         self.counter = FootfallCounter(
-            line_start=line["start"],
-            line_end=line["end"],
+            lines=lines,
             minimum_crossing_threshold=config["settings"].get("minimum_crossing_threshold", 2),
             csv_path=csv_path,
         )
@@ -74,7 +81,7 @@ class FootfallPipeline:
 
         # Shared state between display and detection threads (protected by lock)
         self._lock = threading.Lock()
-        self._det_queue = queue.Queue(maxsize=5)  # frames for detection thread to process in order
+        self._det_queue = queue.Queue(maxsize=1)  # only freshest frame matters
         self.last_detections = sv.Detections.empty()
         self.last_counts = {"entries": 0, "exits": 0, "occupancy": 0}
 
@@ -92,6 +99,15 @@ class FootfallPipeline:
 
         # Logging
         self.last_log_time = time.time()
+
+    def _resize_frame(self, frame):
+        """Resize frame to target resolution if needed."""
+        if self.target_resolution and frame is not None:
+            h, w = frame.shape[:2]
+            tw, th = self.target_resolution
+            if w != tw or h != th:
+                frame = cv2.resize(frame, (tw, th))
+        return frame
 
     def _detection_loop(self):
         """Background thread: processes frames from queue in order."""
@@ -144,13 +160,16 @@ class FootfallPipeline:
                 if self.camera.stopped:
                     print("[Pipeline] Camera permanently stopped, exiting")
                     break
-                if self.none_frame_count >= 5:
+                if self.none_frame_count >= 50:
                     print("[Pipeline] Stream lost, forcing reconnect...")
-                    self.camera.connected = False
+                    self.camera.force_reconnect()
                     self.none_frame_count = 0
+                if not self.save_video:
+                    cv2.waitKey(1)
                 continue
 
             self.none_frame_count = 0
+            frame = self._resize_frame(frame)
             self.frame_count += 1
 
             # Send every Nth frame to detection thread (in order, non-blocking)
@@ -193,9 +212,11 @@ class FootfallPipeline:
                 self._log_counts()
                 self.last_log_time = now
 
-            # Key handling (only when showing window)
-            if not self.save_video:
-                key = cv2.waitKey(1) & 0xFF
+            # Key handling and frame pacing
+            if self.save_video:
+                time.sleep(0.033)  # pace headless mode
+            else:
+                key = cv2.waitKey(33) & 0xFF
                 if key == ord('q'):
                     print("\n[Pipeline] Quit requested")
                     break
@@ -210,11 +231,12 @@ class FootfallPipeline:
         if self.config.get("staff_zones"):
             annotated = draw_staff_zones(annotated, self.config["staff_zones"])
 
-        # Draw counting line
-        annotated = self.line_annotator.annotate(
-            frame=annotated,
-            line_counter=self.counter.line_zone,
-        )
+        # Draw counting line(s)
+        for lz in self.counter.line_zones:
+            annotated = self.line_annotator.annotate(
+                frame=annotated,
+                line_counter=lz,
+            )
 
         # Draw bounding boxes and labels on customers
         with self._lock:
@@ -251,8 +273,9 @@ class FootfallPipeline:
     def _log_counts(self):
         """Print counts to console."""
         ts = time.strftime("%H:%M:%S")
-        c = self.last_counts
-        staff = self.staff_excluder.staff_count
+        with self._lock:
+            c = self.last_counts.copy()
+            staff = self.staff_excluder.staff_count
         print(
             f"[{ts}] Entries: {c['entries']:>4} | "
             f"Exits: {c['exits']:>4} | "
@@ -271,13 +294,16 @@ class FootfallPipeline:
             print(f"[Pipeline] Annotated video saved to {self.save_video}")
         self.camera.stop()
         cv2.destroyAllWindows()
+        with self._lock:
+            counts = self.last_counts.copy()
+            staff = self.staff_excluder.staff_count
         print("[Pipeline] Shutdown complete")
         print()
         print(f"=== FINAL COUNTS ===")
-        print(f"  Entries:  {self.last_counts['entries']}")
-        print(f"  Exits:    {self.last_counts['exits']}")
-        print(f"  Inside:   {self.last_counts['occupancy']}")
-        print(f"  Staff:    {self.staff_excluder.staff_count} excluded")
+        print(f"  Entries:  {counts['entries']}")
+        print(f"  Exits:    {counts['exits']}")
+        print(f"  Inside:   {counts['occupancy']}")
+        print(f"  Staff:    {staff} excluded")
 
 
 def main():
