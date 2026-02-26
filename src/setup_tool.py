@@ -1,4 +1,4 @@
-"""Visual Setup Tool - Draw counting lines and staff zones on camera feed.
+"""Visual Setup Tool - Draw counting lines, detection zone, and staff zones on camera feed.
 
 Usage:
     python src/setup_tool.py --source <video_file_or_rtsp_url>
@@ -8,6 +8,8 @@ Controls:
     Click 2 points      → Draw counting line (up to 2 lines)
     Click up to 4 more  → Mark the INSIDE (store) side of that line
     N                   → Finish current line, start next line
+    D + click corners   → Draw DETECTION ZONE (only detect people inside this area)
+    Enter               → Close detection zone polygon
     Z + click corners   → Draw staff zone polygon
     Enter               → Close current zone polygon
     S                   → Save config to config.yaml
@@ -49,6 +51,12 @@ class SetupTool:
         self.current_line_points_full = []  # full-res coords
         self.current_in_points = []         # full-res
         self.current_in_points_display = [] # display coords
+
+        # Detection zone state (polygon to restrict where YOLO looks)
+        self.det_zone_mode = False
+        self.det_zone_points = []
+        self.det_zone_points_full = []
+        self.detection_zone = None  # final full-res polygon
 
         # Staff zone state
         self.zone_mode = False
@@ -126,9 +134,10 @@ class SetupTool:
         print(f"1. Click 2 points to draw COUNTING LINE 1 (up to {self.max_lines} lines)")
         print(f"2. Click up to {self.max_in_points} points on the INSIDE (store) side")
         print("3. Press N to finish current line and start the next line")
-        print("4. Press Z for zone mode, click corners for STAFF ZONE, Enter to close")
-        print("5. Press S to save config")
-        print("6. Press R to reset | Press Q to quit")
+        print("4. Press D for DETECTION ZONE mode - draw polygon around store floor (excludes glass/outside)")
+        print("5. Press Z for zone mode, click corners for STAFF ZONE, Enter to close")
+        print("6. Press S to save config")
+        print("7. Press R to reset | Press Q to quit")
         print()
 
         cv2.namedWindow(self.window_name)
@@ -161,8 +170,19 @@ class SetupTool:
                         print("  Max lines reached. Press S to save.")
                 else:
                     print("  Draw 2 points for the line first.")
+            elif key == ord('d'):
+                self.det_zone_mode = not self.det_zone_mode
+                self.zone_mode = False
+                if self.det_zone_mode:
+                    self.det_zone_points = []
+                    self.det_zone_points_full = []
+                    print("DETECTION ZONE mode ON - Click corners of store floor area, then press Enter")
+                    print("  Only people inside this zone will be detected (excludes glass/outside)")
+                else:
+                    print("Detection zone mode OFF")
             elif key == ord('z'):
                 self.zone_mode = not self.zone_mode
+                self.det_zone_mode = False
                 if self.zone_mode:
                     self.current_zone_points = []
                     self.current_zone_points_full = []
@@ -170,7 +190,13 @@ class SetupTool:
                 else:
                     print("Zone mode OFF")
             elif key == 13:  # Enter
-                if self.zone_mode and len(self.current_zone_points) >= 3:
+                if self.det_zone_mode and len(self.det_zone_points) >= 3:
+                    self.detection_zone = [list(p) for p in self.det_zone_points_full]
+                    print(f"  Detection zone saved with {len(self.det_zone_points)} points")
+                    self.det_zone_mode = False
+                elif self.det_zone_mode:
+                    print("  Need at least 3 points for detection zone")
+                elif self.zone_mode and len(self.current_zone_points) >= 3:
                     self.zone_counter += 1
                     zone = {
                         "name": f"staff_zone_{self.zone_counter}",
@@ -198,6 +224,12 @@ class SetupTool:
 
         dx, dy = x, y
         fx, fy = int(x * self.scale_x), int(y * self.scale_y)
+
+        if self.det_zone_mode:
+            self.det_zone_points.append((dx, dy))
+            self.det_zone_points_full.append((fx, fy))
+            print(f"  Detection zone point: ({fx}, {fy}) [{len(self.det_zone_points)} points]")
+            return
 
         if self.zone_mode:
             self.current_zone_points.append((dx, dy))
@@ -269,6 +301,30 @@ class SetupTool:
             cv2.putText(self.display_frame, zone["name"], (cx - 40, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+        # Draw detection zone (finalized)
+        if self.detection_zone:
+            dz_full = np.array(self.detection_zone, dtype=np.float64)
+            dz_display = dz_full.copy()
+            dz_display[:, 0] /= self.scale_x
+            dz_display[:, 1] /= self.scale_y
+            dz_display = dz_display.astype(np.int32)
+            overlay = self.display_frame.copy()
+            cv2.fillPoly(overlay, [dz_display], (0, 200, 0))
+            cv2.addWeighted(overlay, 0.2, self.display_frame, 0.8, 0, self.display_frame)
+            cv2.polylines(self.display_frame, [dz_display], True, (0, 200, 0), 2)
+            cx = int(dz_display[:, 0].mean())
+            cy = int(dz_display[:, 1].mean())
+            cv2.putText(self.display_frame, "DETECTION ZONE", (cx - 60, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # Draw detection zone in-progress
+        if self.det_zone_mode and self.det_zone_points:
+            for pt in self.det_zone_points:
+                cv2.circle(self.display_frame, pt, 5, (0, 200, 0), -1)
+            if len(self.det_zone_points) >= 2:
+                pts = np.array(self.det_zone_points, dtype=np.int32)
+                cv2.polylines(self.display_frame, [pts], False, (0, 200, 0), 2)
+
         # Draw current zone-in-progress
         if self.zone_mode and self.current_zone_points:
             for pt in self.current_zone_points:
@@ -278,8 +334,10 @@ class SetupTool:
                 cv2.polylines(self.display_frame, [pts], False, (255, 0, 0), 2)
 
         # Draw mode indicator
-        if self.zone_mode:
-            mode_text = "MODE: ZONE (press Z to toggle)"
+        if self.det_zone_mode:
+            mode_text = "MODE: DETECTION ZONE (click corners, Enter to close)"
+        elif self.zone_mode:
+            mode_text = "MODE: STAFF ZONE (press Z to toggle)"
         else:
             line_num = len(self.completed_lines) + 1
             mode_text = f"MODE: LINE {line_num}/{self.max_lines}"
@@ -364,6 +422,7 @@ class SetupTool:
             },
             "counting_lines": counting_lines,
             "staff_zones": self.completed_zones,
+            "detection_zone": self.detection_zone,
             "settings": settings,
         }
 
@@ -381,6 +440,10 @@ class SetupTool:
         self.completed_zones = []
         self.zone_counter = 0
         self.zone_mode = False
+        self.det_zone_mode = False
+        self.det_zone_points = []
+        self.det_zone_points_full = []
+        self.detection_zone = None
 
 
 def main():
